@@ -92,6 +92,8 @@ struct DriverWorkerTask<T: DeviceBacking> {
     io_issuers: Arc<IoIssuers>,
     #[inspect(skip)]
     recv: mesh::Receiver<NvmeWorkerRequest>,
+    ioqueue_bucket_size: u32,
+    ioqueue_cpu_offset: u32,
     bounce_buffer: bool,
 }
 
@@ -271,6 +273,34 @@ impl<T: DeviceBacking> NvmeDriver<T> {
             send,
         });
 
+        let dev_id = device.id();
+        let ioqueue_bucket_size = cpu_count/device.max_interrupt_count();
+        // if ioqueue_bucket_size == 0 {
+        //     ioqueue_bucket_size = 1;
+        // }
+        // TODO: Offset should be piped in from scsi striping code
+        let offset = match dev_id {
+            "b44c:00:00.0" => 0,
+            "6ee8:00:00.0" => 1,
+            "bf1c:00:00.0" => 2,
+            "91c2:00:00.0" => 3,
+            "e92a:00:00.0" => 4,
+            "752a:00:00.0" => 5,
+            "ac0f:00:00.0" => 6,
+            "d065:00:00.0" => 7,
+
+            "c05b:00:00.0" => 0,           
+            _=> { tracing::error!(dev_id, "Device ID is unknown"); 0}
+        };
+        tracing::error!(
+            dev_id,
+            cpu_count,
+            ic = device.max_interrupt_count(),
+            offset,
+            ioqueue_bucket_size,
+            "vars"
+        );
+
         Ok(Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
@@ -280,6 +310,8 @@ impl<T: DeviceBacking> NvmeDriver<T> {
                 admin: None,
                 io: Vec::new(),
                 io_issuers: io_issuers.clone(),
+                ioqueue_bucket_size: ioqueue_bucket_size,
+                ioqueue_cpu_offset: offset,
                 recv,
                 bounce_buffer,
             })),
@@ -493,12 +525,24 @@ impl<T: DeviceBacking> NvmeDriver<T> {
 
         // Pre-create the IO queue 1 for CPU 0. The other queues will be created
         // lazily. Numbering for I/O queues starts with 1 (0 is Admin).
-        let issuer = worker
-            .create_io_queue(&mut state, 0)
-            .await
-            .context("failed to create io queue 1")?;
-
-        self.io_issuers.per_cpu[0].set(issuer).unwrap();
+        if self.device_id == "c05b:00:00.0" {
+            let issuer = worker
+                .create_io_queue(&mut state, 0)
+                .await
+                .context("failed to create io queue")?;
+            self.io_issuers.per_cpu[0].set(issuer).unwrap();
+        } else {
+            // TODO: This should be removed, but will require changes to work with sidecar
+            for i in 0..max_interrupt_count {
+                let cpu = i*worker.ioqueue_bucket_size + worker.ioqueue_cpu_offset;
+                tracing::error!(cpu, "cpu");
+                let issuer = worker
+                    .create_io_queue(&mut state, cpu)
+                    .await
+                    .context("failed to create io queue")?;
+                self.io_issuers.per_cpu[cpu as usize].set(issuer).unwrap();
+            }
+        }
         task.insert(&self.driver, "nvme_worker", state);
         task.start();
         Ok(())
@@ -635,6 +679,31 @@ impl<T: DeviceBacking> NvmeDriver<T> {
             send,
         });
 
+        let devid = device.id();
+        let ioqueue_bucket_size = cpu_count/device.max_interrupt_count();
+
+        let offset = match devid {
+            "b44c:00:00.0" => 0,
+            "6ee8:00:00.0" => 1,
+            "bf1c:00:00.0" => 2,
+            "91c2:00:00.0" => 3,
+            "e92a:00:00.0" => 4,
+            "752a:00:00.0" => 5,
+            "ac0f:00:00.0" => 6,
+            "d065:00:00.0" => 7,
+
+            "c05b:00:00.0" => 0,           
+            _=> { tracing::error!(devid, "Device ID is unknown. RESTORE"); 0}
+        };
+        
+        tracing::error!(
+            cpu_count,
+            test = device.max_interrupt_count(),
+            offset,
+            ioqueue_bucket_size,
+            "vars"
+        );
+
         let mut this = Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
@@ -644,6 +713,8 @@ impl<T: DeviceBacking> NvmeDriver<T> {
                 admin: None, // Updated below.
                 io: Vec::new(),
                 io_issuers: io_issuers.clone(),
+                ioqueue_bucket_size: ioqueue_bucket_size,
+                ioqueue_cpu_offset: offset,
                 recv,
                 bounce_buffer,
             })),
@@ -951,11 +1022,38 @@ impl<T: DeviceBacking> AsyncRun<WorkerState> for DriverWorkerTask<T> {
 }
 
 impl<T: DeviceBacking> DriverWorkerTask<T> {
+
+    fn get_ioqueue_cpu(&self, requesting_cpu: u32) -> u32 {
+        if self.ioqueue_bucket_size == 0 {
+            return requesting_cpu;
+        }
+        let total_cpus = self.ioqueue_bucket_size * self.device.max_interrupt_count();
+        let shift = requesting_cpu;
+        // Code below adds shift to each 
+        // let shift = (requesting_cpu + self.ioqueue_bucket_size*(requesting_cpu % self.ioqueue_bucket_size+self.ioqueue_cpu_offset)) % total_cpus;
+        let cpu = shift - (shift % self.ioqueue_bucket_size)+self.ioqueue_cpu_offset;
+        return cpu;
+    }
+
     async fn create_io_issuer(&mut self, state: &mut WorkerState, cpu: u32) {
         tracing::debug!(cpu, "issuer request");
         if self.io_issuers.per_cpu[cpu as usize].get().is_some() {
             return;
         }
+
+        let ioqueue_cpu = self.get_ioqueue_cpu(cpu);
+        let ioqueue_cpu_issuer = self.io_issuers.per_cpu[ioqueue_cpu as usize].get();
+        if ioqueue_cpu_issuer.is_some() {
+            let copy_issuer = ioqueue_cpu_issuer.unwrap().clone();
+            self.io_issuers.per_cpu[cpu as usize]
+                .set(copy_issuer)
+                .ok()
+                .unwrap();
+
+            tracing::error!(devid = self.device.id(), cpu, ioqueue_cpu, "-=- ioqueue copy");
+            return;
+        }
+
 
         let issuer = match self
             .create_io_queue(state, cpu)
@@ -965,7 +1063,7 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
             Ok(issuer) => issuer,
             Err(err) => {
                 // Find a fallback queue close in index to the failed queue.
-                let (fallback_cpu, fallback) = self.io_issuers.per_cpu[..cpu as usize]
+                let (fallback_cpu, fallback) = self.io_issuers.per_cpu[..96 as usize]
                     .iter()
                     .enumerate()
                     .rev()
@@ -1006,21 +1104,33 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
     async fn create_io_queue(
         &mut self,
         state: &mut WorkerState,
-        cpu: u32,
+        requesting_cpu: u32,
     ) -> Result<IoIssuer, DeviceError> {
         if self.io.len() >= state.max_io_queues as usize {
             return Err(DeviceError::NoMoreIoQueues(state.max_io_queues));
         }
-
         let qid = self.io.len() as u16 + 1;
 
-        tracing::debug!(cpu, qid, "creating io queue");
+
+        tracing::debug!(requesting_cpu, qid, "creating io queue");
+
+        let interrupt_cpu = requesting_cpu;
+        // let interrupt_cpu = self.get_ioqueue_cpu(requesting_cpu);
+        // if self.io_issuers.per_cpu[interrupt_cpu as usize]
+        //     .get()
+        //     .is_some()
+        // {
+        //     tracing::error!("IO queue already created here");
+        //     anyhow::bail!("Closest IO queue is already created.");
+        // }
+
+        tracing::error!(devid = self.device.id(), requesting_cpu, interrupt_cpu, "-=- ioqueue created");
 
         // Share IO queue 1's interrupt with the admin queue.
         let iv = self.io.len() as u16;
         let interrupt = self
             .device
-            .map_interrupt(iv.into(), cpu)
+            .map_interrupt(iv.into(), interrupt_cpu)
             .map_err(DeviceError::InterruptMapFailure)?;
 
         let queue = QueuePair::new(
@@ -1044,7 +1154,7 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
 
         // Add the queue pair before aliasing its memory with the device so
         // that it can be torn down correctly on failure.
-        self.io.push(IoQueue { queue, iv, cpu });
+        self.io.push(IoQueue { queue, iv, cpu: interrupt_cpu });
         let io_queue = self.io.last_mut().unwrap();
 
         let admin = self.admin.as_ref().unwrap().issuer().as_ref();
@@ -1111,7 +1221,7 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
 
         Ok(IoIssuer {
             issuer: io_queue.queue.issuer().clone(),
-            cpu,
+            cpu: interrupt_cpu,
         })
     }
 
