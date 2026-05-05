@@ -143,6 +143,8 @@ struct DriverWorkerTask<D: DeviceBacking> {
     io_issuers: Arc<IoIssuers>,
     #[inspect(skip)]
     recv: mesh::Receiver<NvmeWorkerRequest>,
+    ioqueue_bucket_size: u32,
+    ioqueue_cpu_offset: u32,
     bounce_buffer: bool,
     /// Shared drain-after-restore barrier builder, present while a drain is
     /// in progress after restore. Newly created IO queues use this to obtain
@@ -338,6 +340,16 @@ impl<D: DeviceBacking> NvmeDriver<D> {
             send,
         });
 
+        // TODO: Offset should be passed in from scsi striping code so each device
+        // has a different offset. This will ensure each device is sending io queues to different
+        // cpus. (Before I used a match on the device id to determine offset but that was for testing)
+        let offset = 1;
+        let ioqueue_bucket_size = if device.max_interrupt_count()>cpu_count {
+            1
+        } else {
+            cpu_count/device.max_interrupt_count()
+        };
+
         Ok(Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
@@ -349,6 +361,8 @@ impl<D: DeviceBacking> NvmeDriver<D> {
                 proto_io: HashMap::new(),
                 next_ioq_id: 1,
                 io_issuers: io_issuers.clone(),
+                ioqueue_bucket_size: ioqueue_bucket_size,
+                ioqueue_cpu_offset: offset,
                 recv,
                 bounce_buffer,
                 drain_after_restore_builder: None,
@@ -565,12 +579,16 @@ impl<D: DeviceBacking> NvmeDriver<D> {
 
         self.admin = Some(admin.issuer().clone());
 
-        // Pre-create the IO queue 1 for CPU 0. The other queues will be created
-        // lazily. Numbering for I/O queues starts with 1 (0 is Admin).
-        let issuer = worker
-            .create_io_queue(&mut state, 0)
-            .await
-            .context("failed to create io queue 1")?;
+        // Pre-create all IO queues so they are evenly distributed across cpus
+        for i in 0..max_interrupt_count {
+            let cpu = i*worker.ioqueue_bucket_size + worker.ioqueue_cpu_offset;
+            tracing::error!(cpu, "cpu");
+            let issuer = worker
+                .create_io_queue(&mut state, cpu)
+                .await
+                .context("failed to create io queue")?;
+            self.io_issuers.per_cpu[cpu as usize].set(issuer).unwrap();
+        }
 
         self.io_issuers.per_cpu[0].set(issuer).unwrap();
         task.insert(&self.driver, "nvme_worker", state);
@@ -780,6 +798,16 @@ impl<D: DeviceBacking> NvmeDriver<D> {
             send,
         });
 
+        // TODO: Offset should be passed in from scsi striping code so each device
+        // has a different offset. This will ensure each device is sending io queues to different
+        // cpus. (Before I used a match on the device id to determine offset but that was for testing)
+        let offset = 1
+        let ioqueue_bucket_size = if device.max_interrupt_count()>cpu_count {
+            1
+        } else {
+            cpu_count/device.max_interrupt_count()
+        };
+
         let mut this = Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
@@ -791,6 +819,8 @@ impl<D: DeviceBacking> NvmeDriver<D> {
                 proto_io: HashMap::new(),
                 next_ioq_id: 1,
                 io_issuers: io_issuers.clone(),
+                ioqueue_bucket_size: ioqueue_bucket_size,
+                ioqueue_cpu_offset: offset,
                 recv,
                 bounce_buffer,
                 drain_after_restore_builder: None, // Updated below after computing drain state.
@@ -1338,6 +1368,19 @@ impl<D: DeviceBacking> AsyncRun<WorkerState> for DriverWorkerTask<D> {
 }
 
 impl<D: DeviceBacking> DriverWorkerTask<D> {
+
+    // Return the CPU a given ioqueue should run on
+    fn get_ioqueue_cpu(&self, requesting_cpu: u32) -> u32 {
+        // Each ioqueue has its own CPU
+        if self.ioqueue_bucket_size == 0 {
+            return requesting_cpu;
+        }
+        // Round the requesting CPU down to the nearest multiple of the bucket size, then add the cpu offset.
+        // Example: device with offset 7 and bucket size 8 will have io queues assigned to cpu 6,13,20, etc.
+        let cpu = requesting_cpu - (requesting_cpu % self.ioqueue_bucket_size) + self.ioqueue_cpu_offset;
+        return cpu;
+    }
+
     fn restore_io_issuer(&mut self, proto: ProtoIoQueue) -> anyhow::Result<()> {
         let pci_id = self.device.id().to_owned();
         let qid = proto.save_state.queue_data.qid;
@@ -1400,6 +1443,18 @@ impl<D: DeviceBacking> DriverWorkerTask<D> {
     async fn create_io_issuer(&mut self, state: &mut WorkerState, cpu: u32) {
         tracing::debug!(cpu, pci_id = ?self.device.id(), "issuer request");
         if self.io_issuers.per_cpu[cpu as usize].get().is_some() {
+            return;
+        }
+
+        let ioqueue_cpu = self.get_ioqueue_cpu(cpu);
+        let ioqueue_cpu_issuer = self.io_issuers.per_cpu[ioqueue_cpu as usize].get();
+        if ioqueue_cpu_issuer.is_some() { 
+            let copy_issuer = ioqueue_cpu_issuer.unwrap().clone();
+            self.io_issuers.per_cpu[cpu as usize]
+                .set(copy_issuer)
+                .ok()
+                .unwrap();
+
             return;
         }
 
